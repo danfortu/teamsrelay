@@ -1,4 +1,4 @@
-import os, time, json, sqlite3, urllib.request
+import os, time, json, sqlite3, urllib.request, hashlib, base64
 from datetime import datetime
 from playwright.sync_api import sync_playwright
 try:
@@ -82,12 +82,67 @@ MSGS_JS = r"""
     let author='';
     const an=e.querySelector('[data-tid="message-author-name"]'); if(an) author=(an.innerText||'').trim();
     if(!author){ const al=e.getAttribute('aria-label')||''; const mm=al.match(/^([^,]+),/); if(mm) author=mm[1].trim(); }
-    let text=''; const bd=e.querySelector('[id^="content-"]')||e.querySelector('[data-tid="messageBodyContent"]'); if(bd) text=(bd.innerText||'').trim();
+    const body = e.querySelector('[id^="content-"]')||e.querySelector('[data-tid="messageBodyContent"]')||e;
+    const QUOTE_SEL='[data-tid="message-reference"],[data-tid="messageQuote"],blockquote,[class*="quoted" i],[class*="reference" i]';
+    const FILE_SEL='[data-tid="file-chiclet"],[data-tid*="fileAttachment" i]';
+    // testo senza la citazione e senza le schede allegato, cosi' non si duplicano
+    let text='';
+    try{ const cl=body.cloneNode(true); cl.querySelectorAll(QUOTE_SEL+','+FILE_SEL).forEach(n=>n.remove()); text=(cl.innerText||'').trim(); }
+    catch(_){ text=(body.innerText||'').trim(); }
     if(!text) text=(e.innerText||'').replace(/\s+/g,' ').trim().slice(0,500);
     let reacts=''; try{ const rc=[...e.querySelectorAll('[aria-label*="reaction" i]')]; reacts=rc.map(x=>(x.getAttribute('aria-label')||'').trim()).filter(Boolean).join(' | ').slice(0,160); }catch(_){}
-    out.push({mid:e.getAttribute('data-mid')||'', author:author.slice(0,60), text:text.slice(0,800), mine:!!mine, reacts:reacts});
+    // citazione (risposta a un messaggio precedente)
+    let reply=null;
+    try{
+      const rq=e.querySelector(QUOTE_SEL);
+      if(rq){
+        let ra=''; const ran=rq.querySelector('[data-tid="message-author-name"],strong,b'); if(ran) ra=(ran.innerText||'').trim();
+        let rt=(rq.innerText||'').replace(/\s+/g,' ').trim();
+        if(ra && rt.startsWith(ra)) rt=rt.slice(ra.length).trim();
+        rt=rt.slice(0,200);
+        if(rt) reply={author:ra.slice(0,60), text:rt};
+      }
+    }catch(_){}
+    // immagini / GIF (esclude emoji e icone piccole)
+    const imgs=[];
+    try{
+      for(const im of body.querySelectorAll('img')){
+        const src=im.currentSrc||im.src||'';
+        if(!src || src.indexOf('http')!==0) continue;
+        const w=im.naturalWidth||im.clientWidth||0, h=im.naturalHeight||im.clientHeight||0;
+        const emojiLike=(im.getAttribute('data-tid')||'').indexOf('emoji')>-1 || /emoji|reaction|avatar/i.test(im.className||'');
+        if(emojiLike) continue;
+        if(w && w<64 && h && h<64) continue;
+        imgs.push({src:src, alt:(im.getAttribute('alt')||'').trim().slice(0,120)});
+        if(imgs.length>=6) break;
+      }
+    }catch(_){}
+    // allegati (solo nome, per ora)
+    const files=[];
+    try{
+      for(const f of e.querySelectorAll(FILE_SEL+',a[download]')){
+        const nm=(f.getAttribute('title')||f.getAttribute('aria-label')||f.innerText||'').replace(/\s+/g,' ').trim();
+        if(nm) files.push({name:nm.slice(0,160)});
+        if(files.length>=6) break;
+      }
+    }catch(_){}
+    out.push({mid:e.getAttribute('data-mid')||'', author:author.slice(0,60), text:text.slice(0,800), mine:!!mine, reacts:reacts, reply:reply, imgs:imgs, files:files});
   }
   return out;
+}
+"""
+
+# Scarica un media (immagine/GIF) dentro la pagina Teams, cosi' usa i cookie della sessione. Ritorna {mime,b64} o null.
+MEDIA_FETCH_JS = r"""
+async (url) => {
+  try{
+    const r=await fetch(url,{credentials:'include'}); if(!r.ok) return null;
+    const b=await r.blob(); if(b.size>8*1024*1024) return null;
+    const bytes=new Uint8Array(await b.arrayBuffer());
+    let bin=''; const CH=0x8000;
+    for(let i=0;i<bytes.length;i+=CH){ bin+=String.fromCharCode.apply(null, bytes.subarray(i,i+CH)); }
+    return {mime:b.type||'image/jpeg', b64:btoa(bin)};
+  }catch(e){ return null; }
 }
 """
 
@@ -101,10 +156,11 @@ def db_init():
             c.execute("DROP TABLE IF EXISTS chats")
             c.execute("CREATE TABLE chats(name TEXT PRIMARY KEY, preview TEXT, pos INTEGER, ts INTEGER, tm TEXT, unread INTEGER, mention INTEGER)")
             c.execute("DROP TABLE IF EXISTS chat_messages")
-            c.execute("CREATE TABLE chat_messages(chat TEXT, idx INTEGER, mid TEXT, author TEXT, text TEXT, mine INTEGER, reacts TEXT)")
+            c.execute("CREATE TABLE chat_messages(chat TEXT, idx INTEGER, mid TEXT, author TEXT, text TEXT, mine INTEGER, reacts TEXT, reply_author TEXT, reply_text TEXT, media TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS commands(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, type TEXT, arg1 TEXT, arg2 TEXT, status TEXT DEFAULT 'pending')")
             c.execute("CREATE TABLE IF NOT EXISTS state(k TEXT PRIMARY KEY, v TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS push_subs(endpoint TEXT PRIMARY KEY, sub TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS media(id TEXT PRIMARY KEY, mime TEXT, name TEXT, data BLOB, ts INTEGER)")
     except Exception as e: print("db_init:", e, flush=True)
 
 def db_msg(title, body):
@@ -125,8 +181,61 @@ def save_chat_messages(chat, msgs):
         with dbc() as c:
             c.execute("DELETE FROM chat_messages WHERE chat=?",(chat,))
             for i,m in enumerate(msgs):
-                c.execute("INSERT INTO chat_messages(chat,idx,mid,author,text,mine,reacts) VALUES(?,?,?,?,?,?,?)",(chat,i,m.get("mid",""),m.get("author",""),m.get("text",""),1 if m.get("mine") else 0,m.get("reacts","")))
+                c.execute("INSERT INTO chat_messages(chat,idx,mid,author,text,mine,reacts,reply_author,reply_text,media) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (chat,i,m.get("mid",""),m.get("author",""),m.get("text",""),1 if m.get("mine") else 0,m.get("reacts",""),
+                     m.get("reply_author",""),m.get("reply_text",""),json.dumps(m.get("media") or [])))
     except Exception as e: print("save_cm:", e, flush=True)
+
+def store_media(page, src, name):
+    """Scarica un'immagine con la sessione Teams del browser e la salva in SQLite. Ritorna {kind,id,name} o None."""
+    if not src or not src.startswith("http"):
+        return None
+    mid = hashlib.sha1(src.encode("utf-8")).hexdigest()[:16]
+    try:
+        with dbc() as c:
+            have = c.execute("SELECT 1 FROM media WHERE id=?", (mid,)).fetchone()
+    except Exception:
+        have = None
+    if not have:
+        try: res = page.evaluate(MEDIA_FETCH_JS, src)
+        except Exception as e: print("media fetch:", e, flush=True); res = None
+        if not res or not res.get("b64"):
+            return None
+        try: data = base64.b64decode(res["b64"])
+        except Exception: return None
+        if not data or len(data) > 8 * 1024 * 1024:
+            return None
+        try:
+            with dbc() as c:
+                c.execute("INSERT OR REPLACE INTO media(id,mime,name,data,ts) VALUES(?,?,?,?,?)",
+                          (mid, res.get("mime", "image/jpeg"), (name or "")[:120], data, int(time.time())))
+        except Exception as e: print("media save:", e, flush=True); return None
+    return {"kind": "image", "id": mid, "name": (name or "")[:120]}
+
+def enrich(page, msgs):
+    """Risolve le immagini in media salvati e appiattisce la citazione per il salvataggio."""
+    for m in msgs:
+        media = []
+        for im in (m.get("imgs") or [])[:6]:
+            d = store_media(page, im.get("src", ""), im.get("alt", ""))
+            if d: media.append(d)
+        for f in (m.get("files") or [])[:6]:
+            nm = (f.get("name") or "").strip()
+            if nm: media.append({"kind": "file", "name": nm[:160]})
+        m["media"] = media
+        rep = m.get("reply") or None
+        m["reply_author"] = (rep.get("author") if rep else "") or ""
+        m["reply_text"] = (rep.get("text") if rep else "") or ""
+    return msgs
+
+def store_open(page, chat):
+    """Legge la chat aperta, scarica i media e salva tutto."""
+    try:
+        msgs = read_open_messages(page)
+        enrich(page, msgs)
+        save_chat_messages(chat, msgs)
+    except Exception as e:
+        print("store_open:", e, flush=True)
 
 def get_state(k, d=""):
     try:
@@ -405,21 +514,21 @@ def main():
                 for cid,ctype,a1,a2 in pending_commands():
                     print("CMD",ctype,a1,flush=True)
                     if ctype=="open":
-                        if open_chat(page,a1): set_state("active_chat",a1); save_chat_messages(a1, read_open_messages(page))
+                        if open_chat(page,a1): set_state("active_chat",a1); store_open(page, a1)
                     elif ctype=="send":
-                        do_send(page,a1,a2); set_state("active_chat",a1); save_chat_messages(a1, read_open_messages(page))
+                        do_send(page,a1,a2); set_state("active_chat",a1); store_open(page, a1)
                     elif ctype=="resync":
                         try: save_chats(page.evaluate(CHATS_JS))
                         except Exception: pass
                         ac=get_state("active_chat")
-                        if ac: save_chat_messages(ac, read_open_messages(page))
+                        if ac: store_open(page, ac)
                     elif ctype=="recheck":
                         ok,why=self_check(page)
                         push_all("Teams", "✓ Tutto funziona" if ok else ("⚠️ Problema: "+why))
                     elif ctype=="react":
                         react_message(page,a1,a2)
                         ac=get_state("active_chat")
-                        if ac: save_chat_messages(ac, read_open_messages(page))
+                        if ac: store_open(page, ac)
                     done_command(cid)
                 if tick % 3 == 0:
                     try:
@@ -433,7 +542,7 @@ def main():
                 if tick % 5 == 0:
                     update_health(page)
                 ac=get_state("active_chat")
-                if ac: save_chat_messages(ac, read_open_messages(page))
+                if ac: store_open(page, ac)
                 # check programmato 2x/giorno
                 slot=selfcheck_slot()
                 if slot:

@@ -79,6 +79,18 @@
   .b .au{ font-size:11px; color:var(--brand); font-weight:700; margin-bottom:2px; }
   .b .st{ font-size:10.5px; margin-top:3px; text-align:right; opacity:.8; }
   .b.me .st{ color:rgba(255,255,255,.85); } .b .st.err{ color:#ffbcbc; font-weight:700; }
+  .b .tx{ white-space:pre-wrap; word-break:break-word; }
+  .b .reply{ border-left:3px solid var(--brand); padding:3px 9px; margin:0 0 5px; background:rgba(127,127,170,.14); border-radius:7px; font-size:12.5px; }
+  .b.me .reply{ background:rgba(255,255,255,.2); border-left-color:#fff; }
+  .b .reply .ra{ display:block; font-weight:700; font-size:11px; opacity:.95; }
+  .b .reply .rx{ display:block; opacity:.85; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .b .media{ margin:4px 0 2px; display:flex; flex-direction:column; gap:5px; }
+  .b .media img{ max-width:100%; max-height:260px; width:auto; border-radius:9px; display:block; object-fit:cover; background:var(--accent); }
+  .b .file{ display:flex; align-items:center; gap:8px; background:rgba(127,127,170,.14); border-radius:9px; padding:7px 10px; font-size:13px; margin-top:4px; word-break:break-word; }
+  .b.me .file{ background:rgba(255,255,255,.2); }
+  .b .mention{ color:var(--brand); font-weight:700; } .b.me .mention{ color:#fff; text-decoration:underline; }
+  .reacts{ display:flex; gap:4px; flex-wrap:wrap; margin-top:5px; }
+  .reacts .rb{ background:var(--card); border:1px solid var(--line); color:var(--ink); border-radius:11px; padding:0 7px; font-size:13px; line-height:21px; }
   .compose{ display:flex; gap:8px; align-items:flex-end; padding:8px calc(env(safe-area-inset-left) + 10px) calc(env(safe-area-inset-bottom) + 8px) 10px; background:var(--card); border-top:1px solid var(--line); }
   .compose textarea{ flex:1; resize:none; border:1px solid var(--line); border-radius:22px; padding:10px 15px; font:inherit; background:var(--bg); color:var(--ink); max-height:120px; -webkit-user-select:text; user-select:text; }
   .compose button{ border:0; background:var(--brand); color:#fff; border-radius:50%; width:44px; height:44px; font-size:18px; flex:none; }
@@ -200,15 +212,35 @@
   }
   function closeConv(){ clearInterval(poll); poll=null; openChat=null; $('conv').classList.remove('on'); loadChats(); }
   let pending=[], lastMsgs=[];
+  function withMentions(t){ return esc(t).replace(/(@[A-Za-z0-9._À-ɏ][A-Za-z0-9._À-ɏ -]{0,38})/g,'<span class="mention">$1</span>'); }
+  function emojiFrom(s){ if(!s) return []; const m=s.match(/[\u{1F300}-\u{1FAFF}☀-➿❤]/gu)||[]; return [...new Set(m)]; }
+  function msgInner(m){
+    const mid=String(m.mid||''); let h='';
+    if(!m.mine && m.author) h+=`<div class="au">${esc(m.author)}</div>`;
+    if(m.reply_text) h+=`<div class="reply">${m.reply_author?`<span class="ra">${esc(m.reply_author)}</span>`:''}<span class="rx">${esc(m.reply_text)}</span></div>`;
+    const media=Array.isArray(m.media)?m.media:[];
+    const imgs=media.filter(x=>x.kind==='image'), files=media.filter(x=>x.kind==='file');
+    if(imgs.length) h+='<div class="media">'+imgs.map(im=>`<img loading="lazy" src="/api/media/${encodeURIComponent(im.id)}" alt="${esc(im.name||'')}" onclick="event.stopPropagation()">`).join('')+'</div>';
+    if((m.text||'').trim()) h+=`<div class="tx">${withMentions(m.text)}</div>`;
+    files.forEach(f=>{ h+=`<div class="file"><span class="ic">📎</span><span>${esc(f.name||'file')}</span></div>`; });
+    const loc=(localReacts[mid]||[]).map(e=>EMO[e]||'');
+    const all=[...new Set([...emojiFrom(m.reacts||''),...loc])].filter(Boolean);
+    if(all.length) h+=`<div class="reacts">${all.map(e=>`<span class="rb">${e}</span>`).join('')}</div>`;
+    if(m.mine) h+='<div class="st">✓ Inviato</div>';
+    return h;
+  }
   function renderMsgs(first){
     const box=$('msgs');
     const atBottom = box.scrollHeight-box.scrollTop-box.clientHeight < 70;
     const realMine = lastMsgs.filter(m=>m.mine).map(m=>(m.text||'').trim());
     pending = pending.filter(p => !realMine.includes(p.text.trim()));
     let html='';
-    lastMsgs.forEach(m=>{ if(!(m.text||'').trim()) return; const mid=String(m.mid||''); const rc=localReacts[mid]||[];
-      const rcHtml=rc.length?`<div class="react">${rc.map(e=>EMO[e]||'').join(' ')}</div>`:'';
-      html+=`<div class="b ${m.mine?'me':'them'}" data-mid="${mid}" onclick="openReact(event,'${mid}')">${(!m.mine&&m.author?`<div class="au">${esc(m.author)}</div>`:'')}${esc(m.text)}${m.mine?'<div class="st">✓ Inviato</div>':''}${rcHtml}</div>`; });
+    lastMsgs.forEach(m=>{
+      const has=(m.text||'').trim() || (Array.isArray(m.media)&&m.media.length) || m.reply_text;
+      if(!has) return;
+      const mid=String(m.mid||'');
+      html+=`<div class="b ${m.mine?'me':'them'}" data-mid="${mid}" onclick="openReact(event,'${mid}')">${msgInner(m)}</div>`;
+    });
     pending.forEach(p=>{ const failed=Date.now()-p.ts>14000; html+=`<div class="b me" style="opacity:.72">${esc(p.text)}<div class="st ${failed?'err':''}">${failed?'✗ Non inviato — riprova':'🕓 Invio…'}</div></div>`; });
     box.innerHTML=html;
     if(first||atBottom||pending.length) box.scrollTop=box.scrollHeight;

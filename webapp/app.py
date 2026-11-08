@@ -1,6 +1,6 @@
 import os, sqlite3, secrets, time, hmac, hashlib, base64, json
 from contextlib import closing
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -116,7 +116,24 @@ def chats(request: Request):
     check(request); return JSONResponse(q("SELECT name,preview,tm,unread,mention FROM chats ORDER BY pos"))
 @app.get("/api/messages")
 def messages(request: Request, name: str):
-    check(request); return JSONResponse(q("SELECT mid,author,text,mine,reacts FROM chat_messages WHERE chat=? ORDER BY idx", (name,)))
+    check(request)
+    rows = q("SELECT mid,author,text,mine,reacts,reply_author,reply_text,media FROM chat_messages WHERE chat=? ORDER BY idx", (name,))
+    for r in rows:
+        try: r["media"] = json.loads(r.get("media") or "[]")
+        except Exception: r["media"] = []
+    return JSONResponse(rows)
+
+@app.get("/api/media/{mid}")
+def media(request: Request, mid: str):
+    check(request)
+    rows = q("SELECT mime,data FROM media WHERE id=?", (mid,))
+    if not rows:
+        raise HTTPException(404)
+    data = rows[0].get("data") or b""
+    if isinstance(data, str):
+        data = data.encode("latin-1", "ignore")
+    return Response(content=data, media_type=rows[0].get("mime") or "application/octet-stream",
+                    headers={"Cache-Control": "private, max-age=86400"})
 
 class OpenReq(BaseModel):
     name: str
